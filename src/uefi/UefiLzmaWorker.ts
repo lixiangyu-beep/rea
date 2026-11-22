@@ -15,6 +15,7 @@ import {
 import { UEFI_FIRMWARE_LIMITS } from "../domain/uefi/uefiLimits.js";
 import { errorMessage } from "../kernel/errorMessage.js";
 import { sha256Hex } from "../kernel/sha256Hex.js";
+import { UefiLzmaByteQueue } from "./UefiLzmaByteQueue.js";
 import {
   encodeLzmaFrame,
   LZMA_FRAME_HEADER_BYTES,
@@ -201,31 +202,30 @@ const decodeStreamPayload = (
   }
 };
 
-const serializeReply = (reply: UefiLzmaReply): string => {
+const serializeReply = (
+  reply: UefiLzmaReply,
+): { readonly text: string; readonly ok: boolean } => {
   const encoded = JSON.stringify(reply);
   if (Buffer.byteLength(encoded) <= UEFI_FIRMWARE_LIMITS.diagnosticBytes) {
-    return encoded;
+    return { text: encoded, ok: reply.ok };
   }
   const bounded: UefiLzmaReply = {
     ok: false,
     reason: reply.ok ? "decoder" : reply.reason,
     message: "LZMA reply exceeds the diagnostic budget.",
   };
-  return JSON.stringify(bounded);
+  return { text: JSON.stringify(bounded), ok: false };
 };
 
 class FramedByteReader {
-  #chunks: Buffer[] = [];
-  #buffered = 0;
+  readonly #queue = new UefiLzmaByteQueue();
   #ended = false;
   #error: unknown;
   #waiter: (() => void) | undefined;
 
   constructor(stream: Readable) {
     stream.on("data", (chunk: Buffer) => {
-      if (chunk.length === 0) return;
-      this.#chunks.push(chunk);
-      this.#buffered += chunk.length;
+      if (!this.#queue.append(chunk)) return;
       const wake = this.#waiter;
       this.#waiter = undefined;
       wake?.();
@@ -249,31 +249,17 @@ class FramedByteReader {
     allowCleanEof = false,
   ): Promise<Buffer | null> {
     if (length === 0) return Buffer.alloc(0);
-    while (this.#buffered < length) {
+    while (this.#queue.available < length) {
       if (this.#error !== undefined) throw this.#error;
       if (this.#ended) {
-        if (allowCleanEof && this.#buffered === 0) return null;
+        if (allowCleanEof && this.#queue.available === 0) return null;
         throw new Error("Truncated LZMA worker frame.");
       }
       await new Promise<void>((resolve) => {
         this.#waiter = resolve;
       });
     }
-    const result = Buffer.allocUnsafe(length);
-    let copied = 0;
-    while (copied < length) {
-      const head = this.#chunks[0]!;
-      const take = Math.min(head.length, length - copied);
-      head.copy(result, copied, 0, take);
-      copied += take;
-      this.#buffered -= take;
-      if (take === head.length) {
-        this.#chunks.shift();
-      } else {
-        this.#chunks[0] = head.subarray(take);
-      }
-    }
-    return result;
+    return this.#queue.read(length);
   }
 }
 
@@ -313,11 +299,10 @@ const runStdioWorker = async (): Promise<void> => {
       request.format,
       request.max_output_bytes,
     );
-    const replyText = serializeReply(reply);
-    const parsedReply = JSON.parse(replyText) as UefiLzmaReply;
+    const serialized = serializeReply(reply);
     const body =
-      parsedReply.ok && decoded !== undefined ? decoded : Buffer.alloc(0);
-    await writeFramed(process.stdout, encodeLzmaFrame(replyText, body));
+      serialized.ok && decoded !== undefined ? decoded : Buffer.alloc(0);
+    await writeFramed(process.stdout, encodeLzmaFrame(serialized.text, body));
   }
 };
 
@@ -355,7 +340,7 @@ const runSingleFileWorker = async (requestPath: string): Promise<void> => {
       message: errorMessage(cause),
     };
   }
-  await writeFile(request.reply_path, serializeReply(reply), {
+  await writeFile(request.reply_path, serializeReply(reply).text, {
     flag: "wx",
     mode: 0o600,
   });
